@@ -94,24 +94,88 @@ def decode_image(uploaded_file) -> np.ndarray:
     return img
 
 
+def _homography_for_tilt(height: int, width: int, angle_degrees: float) -> np.ndarray:
+    """Compute a homography that simulates rotating the camera around the X axis."""
+    f = max(height, width)
+    cx = width / 2.0
+    cy = height / 2.0
+    K = np.array(
+        [
+            [f, 0.0, cx],
+            [0.0, f, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    radians = np.radians(angle_degrees)
+    c = np.cos(radians)
+    s = np.sin(radians)
+    R = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, c, -s],
+            [0.0, s, c],
+        ],
+        dtype=np.float32,
+    )
+    H = K @ R @ np.linalg.inv(K)
+
+    center = np.array([cx, cy, 1.0], dtype=np.float32)
+    proj = H @ center
+    proj /= proj[2]
+    delta_x = cx - proj[0]
+    delta_y = cy - proj[1]
+    T = np.array(
+        [
+            [1.0, 0.0, delta_x],
+            [0.0, 1.0, delta_y],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    return (T @ H).astype(np.float32)
+
+
+def tilt_image_with_homography(img_bgr: np.ndarray, angle_degrees: float) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Apply a perspective warp that pitches the camera up/down while keeping image size."""
+    if abs(angle_degrees) < 1e-3:
+        return img_bgr, None
+    h, w = img_bgr.shape[:2]
+    H = _homography_for_tilt(h, w, angle_degrees)
+    tilted = cv2.warpPerspective(
+        img_bgr,
+        H,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return tilted, H
+
+
+def warp_image_to_shape(img: np.ndarray, homography: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
+    """Warp an image back using the inverse homography."""
+    if homography is None:
+        return img
+    target_h, target_w = target_shape[:2]
+    inv_H = np.linalg.inv(homography)
+    return cv2.warpPerspective(
+        img,
+        inv_H,
+        (target_w, target_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
 @st.cache_resource(show_spinner=True)
 def build_pose_engine(
-    model_path: str,
     device: str,
-    keypoint_cfg_name: str,
-    input_height: int,
-    input_width: int,
+    model_name: str = "2.5.6.0",
 ):
-    """Load PoseInferenceEngine once."""
-    kp_enum = KeyPointConfigurationEnum[keypoint_cfg_name]
-    engine = PoseInferenceEngine.init_from_path(
-        posemodel_path=model_path,
-        device=device,
-        keypoint_cfg=kp_enum,
-        input_height=input_height,
-        input_width=input_width,
-    )
-    kp_config = KeyPointConfigurationFactory.from_enum(kp_enum)
+    """Load PoseInferenceEngine from KCCD once."""
+    engine = PoseInferenceEngine.init_from_kccd(device=device, name=model_name)
+    kp_config = engine.posemodel.keypoint_configuration
     return engine, kp_config
 
 
@@ -403,44 +467,30 @@ def main():
             help="Leave empty to pull from Hugging Face (requires network access).",
         )
 
+        manual_tilt_override = st.checkbox(
+            "Rotate image to compensate tilt",
+            value=False,
+            help="Rotate the uploaded image before inference to emulate a level camera.",
+        )
+        manual_tilt_degrees = st.slider(
+            "Tilt compensation (degrees)",
+            min_value=-60,
+            max_value=60,
+            value=0,
+            step=1,
+            disabled=not manual_tilt_override,
+        )
+
         st.header("Pose inference overlay")
         enable_pose_overlay = st.checkbox(
             "Run PoseInferenceEngine and compare keypoints",
             value=False,
             help="Requires kaia-pose-core/commons and kaia-pose-core/engines/pose-inference to be present.",
         )
-        pose_model_path = st.text_input(
-            "Pose model path (.pth/.ts)",
-            value=os.environ.get("POSE_MODEL_PATH", ""),
-            help="TorchScript model used by PoseInferenceEngine",
-            disabled=not enable_pose_overlay,
-        )
-        if KeyPointConfigurationEnum:
-            _kp_options = [e.name for e in KeyPointConfigurationEnum]
-            _default_kp_idx = _kp_options.index("KAIA_23") if "KAIA_23" in _kp_options else 0
-        else:
-            _kp_options = ["Unavailable"]
-            _default_kp_idx = 0
-        pose_keypoint_cfg_name = st.selectbox(
-            "Keypoint configuration",
-            options=_kp_options,
-            index=_default_kp_idx,
-            disabled=not enable_pose_overlay or KeyPointConfigurationEnum is None,
-        )
-        pose_input_height = st.number_input(
-            "Pose model input height",
-            value=256,
-            min_value=64,
-            max_value=1024,
-            step=32,
-            disabled=not enable_pose_overlay,
-        )
-        pose_input_width = st.number_input(
-            "Pose model input width",
-            value=192,
-            min_value=64,
-            max_value=1024,
-            step=32,
+        pose_model_name = st.text_input(
+            "Pose model name from KCCD",
+            value="2.5.8.0",
+            help="Model name/tag to fetch from Kaia Commons Central Database",
             disabled=not enable_pose_overlay,
         )
         pose_device = st.selectbox(
@@ -452,192 +502,225 @@ def main():
 
         st.caption("Tip: disable optional modules if you only want full-image inference " "without masks or FOV estimation.")
 
-    # Main content area - two columns
-    col1, col2 = st.columns([1, 1])
+    # Main content area
+    uploaded_file = st.file_uploader(
+        "Upload an image",
+        type=["png", "jpg", "jpeg", "bmp", "tiff", "webp"],
+        help="Upload a single image for 3D body estimation",
+    )
 
-    with col1:
-        st.header("📸 Image Upload")
+    if uploaded_file is None:
+        st.stop()
 
-        uploaded_file = st.file_uploader(
-            "Upload an image",
-            type=["png", "jpg", "jpeg", "bmp", "tiff", "webp"],
-            help="Upload a single image for 3D body estimation",
+    # Load image
+    img_bgr = decode_image(uploaded_file)
+    original_image_bgr = img_bgr.copy()
+    tilt_transform = None
+    if manual_tilt_override and abs(manual_tilt_degrees) > 1e-3:
+        img_bgr, tilt_transform = tilt_image_with_homography(img_bgr, -manual_tilt_degrees)
+    st.session_state.current_image = img_bgr
+    st.session_state.image_name = uploaded_file.name
+
+    if manual_tilt_override and tilt_transform is not None:
+        before_col, after_col = st.columns(2)
+        before_col.image(
+            cv2.cvtColor(original_image_bgr, cv2.COLOR_BGR2RGB),
+            caption="Original (tilted)",
+            use_container_width=True,
+        )
+        after_col.image(
+            cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
+            caption="Leveled input (used for inference)",
+            use_container_width=True,
         )
 
-        if uploaded_file is not None:
-            # Load and display image
-            img_bgr = decode_image(uploaded_file)
-            st.session_state.current_image = img_bgr
-            st.session_state.image_name = uploaded_file.name
+    if st.session_state.current_image is not None:
+        run_clicked = st.button("▶️ Run Inference", type="primary")
 
-            img_height, img_width = img_bgr.shape[:2]
+    if not run_clicked:
+        st.stop()
 
-            # Display image
-            display_img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            st.image(display_img, caption=f"Image: {uploaded_file.name} ({img_width}x{img_height})", use_container_width=True)
+    # Check checkpoints exist
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        ckpt_dir = os.path.dirname(checkpoint_path)
+        try:
+            with st.spinner("Checkpoint not found, downloading selected model..."):
+                download_checkpoint(
+                    repo_id=model_info["repo_id"],
+                    out_dir=ckpt_dir,
+                    token=hf_token,
+                )
+        except Exception as exc:
+            st.error(f"Checkpoint path does not exist and auto-download failed: {exc}")
+            st.stop()
 
-    with col2:
-        st.header("🤖 Model Inference")
+    if not mhr_path or not os.path.exists(mhr_path):
+        mhr_dir = os.path.dirname(os.path.dirname(mhr_path))
+        try:
+            with st.spinner("MHR asset not found, downloading selected model..."):
+                download_checkpoint(
+                    repo_id=model_info["repo_id"],
+                    out_dir=mhr_dir,
+                    token=hf_token,
+                )
+        except Exception as exc:
+            st.error(f"MHR asset path does not exist and auto-download failed: {exc}")
+            st.stop()
 
-        if st.session_state.current_image is not None:
-            run_clicked = st.button("▶️ Run Inference", type="primary", use_container_width=True)
+    if use_segmentor and not segmentor_path:
+        st.error("SAM2 path is required when loading the segmentor.")
+        st.stop()
 
-            if run_clicked:
-                # Check checkpoints exist
-                if not checkpoint_path or not os.path.exists(checkpoint_path):
-                    ckpt_dir = os.path.dirname(checkpoint_path)
-                    try:
-                        with st.spinner("Checkpoint not found, downloading selected model..."):
-                            download_checkpoint(
-                                repo_id=model_info["repo_id"],
-                                out_dir=ckpt_dir,
-                                token=hf_token,
-                            )
-                    except Exception as exc:
-                        st.error(f"Checkpoint path does not exist and auto-download failed: {exc}")
-                        st.stop()
+    # Load model
+    with st.spinner("Loading model and helpers..."):
+        estimator, device_str = build_estimator(
+            checkpoint_path=checkpoint_path,
+            mhr_path=mhr_path,
+            use_cuda=use_cuda,
+            use_detector=use_detector,
+            detector_name="vitdet",
+            detector_path=detector_path,
+            use_segmentor=use_segmentor,
+            segmentor_name="sam2",
+            segmentor_path=segmentor_path,
+            use_fov=use_fov,
+            fov_name="moge2",
+            fov_path=fov_path,
+        )
+    st.success(f"✅ Model loaded. Running on {device_str}.")
 
-                if not mhr_path or not os.path.exists(mhr_path):
-                    mhr_dir = os.path.dirname(os.path.dirname(mhr_path))
-                    try:
-                        with st.spinner("MHR asset not found, downloading selected model..."):
-                            download_checkpoint(
-                                repo_id=model_info["repo_id"],
-                                out_dir=mhr_dir,
-                                token=hf_token,
-                            )
-                    except Exception as exc:
-                        st.error(f"MHR asset path does not exist and auto-download failed: {exc}")
-                        st.stop()
+    # Run inference
+    with st.spinner("Running inference..."):
+        sam_engine = Sam3DBodyInferenceEngine(
+            estimator,
+            bbox_thresh=bbox_thresh,
+            use_mask=use_segmentor,
+        )
+        outputs = sam_engine.run_single(st.session_state.current_image)
 
-                if use_segmentor and not segmentor_path:
-                    st.error("SAM2 path is required when loading the segmentor.")
-                    st.stop()
+    if len(outputs) == 0:
+        st.warning("No humans detected in the image.")
+    else:
+        st.success(f"✅ Detected {len(outputs)} person(s)")
 
-                # Load model
-                with st.spinner("Loading model and helpers..."):
-                    estimator, device_str = build_estimator(
-                        checkpoint_path=checkpoint_path,
-                        mhr_path=mhr_path,
-                        use_cuda=use_cuda,
-                        use_detector=use_detector,
-                        detector_name="vitdet",
-                        detector_path=detector_path,
-                        use_segmentor=use_segmentor,
-                        segmentor_name="sam2",
-                        segmentor_path=segmentor_path,
-                        use_fov=use_fov,
-                        fov_name="moge2",
-                        fov_path=fov_path,
-                    )
-                st.success(f"✅ Model loaded. Running on {device_str}.")
-
-                # Run inference
-                with st.spinner("Running inference..."):
-                    sam_engine = Sam3DBodyInferenceEngine(
-                        estimator,
-                        bbox_thresh=bbox_thresh,
-                        use_mask=use_segmentor,
-                    )
-                    outputs = sam_engine.run_single(st.session_state.current_image)
-
-                if len(outputs) == 0:
-                    st.warning("No humans detected in the image.")
-                else:
-                    st.success(f"✅ Detected {len(outputs)} person(s)")
-
-                    # Visualize results
-                    render_bgr = visualize_sample_together(st.session_state.current_image, outputs, estimator.faces)
-                    render_rgb = cv2.cvtColor(render_bgr.astype(np.uint8), cv2.COLOR_BGR2RGB)
-                    st.image(render_rgb, caption="Result with 3D mesh overlay", use_container_width=True)
-
-                    # Show 3D mesh if enabled
-                    if show_mesh:
-                        st.subheader("3D Mesh Visualization")
-                        tabs = st.tabs([f"Person {i+1}" for i in range(len(outputs))])
-                        for tab, prediction in zip(tabs, outputs):
-                            with tab:
-                                fig = build_plotly_mesh(
-                                    vertices=prediction["pred_vertices"],
-                                    faces=estimator.faces,
-                                    cam_t=prediction.get("pred_cam_t"),
-                                )
-                                st.plotly_chart(fig, use_container_width=True)
-
-                    # Show masks if enabled
-                    if show_mask:
-                        has_masks = any(prediction.get("mask") is not None for prediction in outputs)
-                        if has_masks:
-                            st.subheader("Segmentation Masks")
-                            mask_tabs = st.tabs([f"Mask {i+1}" for i in range(len(outputs))])
-                            for tab, prediction in zip(mask_tabs, outputs):
-                                with tab:
-                                    mask = prediction.get("mask")
-                                    if mask is not None:
-                                        overlay_rgb = build_mask_overlay(st.session_state.current_image, mask)
-                                        st.image(overlay_rgb, caption="Mask overlay", use_container_width=True)
-                        else:
-                            st.info("Masks not available. Enable SAM2 to visualize them.")
-
-                    # PoseInferenceEngine overlay
-                    if enable_pose_overlay:
-                        st.subheader("Keypoint comparison (PoseInferenceEngine vs SAM mesh)")
-                        if not pose_model_path:
-                            st.error("Provide a pose model path to run PoseInferenceEngine.")
-                        else:
-                            with st.spinner("Running PoseInferenceEngine on the image..."):
-                                try:
-                                    pose_engine, kp_config = build_pose_engine(
-                                        model_path=pose_model_path,
-                                        device=pose_device,
-                                        keypoint_cfg_name=pose_keypoint_cfg_name,
-                                        input_height=pose_input_height,
-                                        input_width=pose_input_width,
-                                    )
-                                    pose_body = pose_engine.perform_on_image(
-                                        cv2.cvtColor(st.session_state.current_image, cv2.COLOR_BGR2RGB)
-                                    )
-                                except Exception as exc:
-                                    st.error(f"PoseInferenceEngine failed: {exc}")
-                                    pose_body = None
-
-                            if pose_body is None:
-                                st.info("PoseInferenceEngine did not return any keypoints for this image.")
-                            else:
-                                pose_kps_norm, pose_mask = body_dict_to_array(pose_body, kp_config)
-                                if not pose_mask.any():
-                                    st.info("PoseInferenceEngine returned empty keypoints.")
-                                else:
-                                    target_idx = 0
-                                    if len(outputs) > 1:
-                                        target_idx = st.number_input(
-                                            "Pick SAM detection index for comparison (0-based)",
-                                            min_value=0,
-                                            max_value=len(outputs) - 1,
-                                            value=0,
-                                        )
-
-                                    sam_kps, sam_mask = extract_kaia23_keypoints(
-                                        outputs[target_idx],
-                                        image_shape=st.session_state.current_image.shape,
-                                        kp_config=kp_config,
-                                    )
-                                    overlay_bgr = draw_keypoints_overlay(
-                                        st.session_state.current_image,
-                                        pose_kps_norm=pose_kps_norm,
-                                        pose_mask=pose_mask,
-                                        sam_kps=sam_kps,
-                                        sam_mask=sam_mask,
-                                        kp_config=kp_config,
-                                    )
-                                    overlay_rgb = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
-                                    st.image(
-                                        overlay_rgb,
-                                        caption="PoseInferenceEngine (green) vs SAM mesh vertices (blue)",
-                                        use_container_width=True,
-                                    )
+        # Visualize results
+        render_bgr = visualize_sample_together(st.session_state.current_image, outputs, estimator.faces)
+        render_bgr = render_bgr.astype(np.uint8)
+        render_rgb_leveled = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2RGB)
+        if tilt_transform is None:
+            st.image(render_rgb_leveled, caption="Result with 3D mesh overlay", use_container_width=True)
         else:
-            st.info("👈 Upload an image to get started")
+            render_bgr_warped = warp_image_to_shape(render_bgr, tilt_transform, original_image_bgr.shape)
+            render_rgb_warped = cv2.cvtColor(render_bgr_warped, cv2.COLOR_BGR2RGB)
+            leveled_col, orig_col = st.columns(2)
+            leveled_col.image(
+                render_rgb_leveled,
+                caption="Result on leveled image",
+                use_container_width=True,
+            )
+            orig_col.image(
+                render_rgb_warped,
+                caption="Result reprojected to original orientation",
+                use_container_width=True,
+            )
+
+        # Show 3D mesh if enabled
+        if show_mesh:
+            st.subheader("3D Mesh Visualization")
+            tabs = st.tabs([f"Person {i+1}" for i in range(len(outputs))])
+            for tab, prediction in zip(tabs, outputs):
+                with tab:
+                    fig = build_plotly_mesh(
+                        vertices=prediction["pred_vertices"],
+                        faces=estimator.faces,
+                        cam_t=prediction.get("pred_cam_t"),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+        # Show masks if enabled
+        if show_mask:
+            has_masks = any(prediction.get("mask") is not None for prediction in outputs)
+            if has_masks:
+                st.subheader("Segmentation Masks")
+                mask_tabs = st.tabs([f"Mask {i+1}" for i in range(len(outputs))])
+                for tab, prediction in zip(mask_tabs, outputs):
+                    with tab:
+                        mask = prediction.get("mask")
+                        if mask is not None:
+                            overlay_rgb = build_mask_overlay(st.session_state.current_image, mask)
+                            if tilt_transform is not None:
+                                overlay_rgb = warp_image_to_shape(
+                                    overlay_rgb, tilt_transform, original_image_bgr.shape
+                                )
+                            st.image(overlay_rgb, caption="Mask overlay", use_container_width=True)
+            else:
+                st.info("Masks not available. Enable SAM2 to visualize them.")
+
+        # PoseInferenceEngine overlay
+        if enable_pose_overlay:
+            st.subheader("Keypoint comparison (PoseInferenceEngine vs SAM mesh)")
+            if not pose_model_name:
+                st.error("Provide a pose model name to run PoseInferenceEngine.")
+            else:
+                with st.spinner("Loading PoseInferenceEngine from KCCD..."):
+                    try:
+                        pose_engine, kp_config = build_pose_engine(
+                            device=pose_device,
+                            model_name=pose_model_name,
+                        )
+                    except Exception as exc:
+                        st.error(f"Failed to load PoseInferenceEngine: {exc}")
+                        pose_engine = None
+
+                if pose_engine is not None:
+                    with st.spinner("Running PoseInferenceEngine on the image..."):
+                        try:
+                            pose_body = pose_engine.perform_on_image(
+                                cv2.cvtColor(st.session_state.current_image, cv2.COLOR_BGR2RGB)
+                            )
+                        except Exception as exc:
+                            st.error(f"PoseInferenceEngine failed: {exc}")
+                            pose_body = None
+
+                if pose_body is None:
+                    st.info("PoseInferenceEngine did not return any keypoints for this image.")
+                else:
+                    pose_kps_norm, pose_mask = body_dict_to_array(pose_body, kp_config)
+                    if not pose_mask.any():
+                        st.info("PoseInferenceEngine returned empty keypoints.")
+                    else:
+                        target_idx = 0
+                        if len(outputs) > 1:
+                            target_idx = st.number_input(
+                                "Pick SAM detection index for comparison (0-based)",
+                                min_value=0,
+                                max_value=len(outputs) - 1,
+                                value=0,
+                            )
+
+                        sam_kps, sam_mask = extract_kaia23_keypoints(
+                            outputs[target_idx],
+                            image_shape=st.session_state.current_image.shape,
+                            kp_config=kp_config,
+                        )
+                        overlay_bgr = draw_keypoints_overlay(
+                            st.session_state.current_image,
+                            pose_kps_norm=pose_kps_norm,
+                            pose_mask=pose_mask,
+                            sam_kps=sam_kps,
+                            sam_mask=sam_mask,
+                            kp_config=kp_config,
+                        )
+                        overlay_rgb = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
+                        if tilt_transform is not None:
+                            overlay_rgb = warp_image_to_shape(
+                                overlay_rgb, tilt_transform, original_image_bgr.shape
+                            )
+                        st.image(
+                            overlay_rgb,
+                            caption="PoseInferenceEngine (green) vs SAM mesh vertices (blue)",
+                            width=640,
+                        )
 
 
 if __name__ == "__main__":

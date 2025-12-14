@@ -30,7 +30,7 @@ from sam_3d_body import SAM3DBodyEstimator, load_sam_3d_body
 from tools.vis_utils import visualize_sample_together
 from pose_inference.engine import PoseInferenceEngine
 from kaia_commons.models import KeyPointConfigurationEnum, KeyPointConfigurationFactory
-from sam_inference_engine import Sam3DBodyInferenceEngine, extract_kaia23_keypoints
+from sam_inference_engine import Sam3DBodyInferenceEngine
 
 
 def pick_device(use_cuda: bool) -> str:
@@ -698,11 +698,9 @@ def main():
                                 value=0,
                             )
 
-                        sam_kps, sam_mask = extract_kaia23_keypoints(
-                            outputs[target_idx],
-                            image_shape=st.session_state.current_image.shape,
-                            kp_config=kp_config,
-                        )
+                        target_prediction = outputs[target_idx]
+                        sam_kps = target_prediction.get("kaia23_keypoints")
+                        sam_mask = target_prediction.get("kaia23_mask")
                         overlay_bgr = draw_keypoints_overlay(
                             st.session_state.current_image,
                             pose_kps_norm=pose_kps_norm,

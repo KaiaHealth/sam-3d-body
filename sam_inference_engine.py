@@ -7,7 +7,7 @@ of images with a consistent bbox threshold / mask flag. The module also exposes
 space, which is useful for comparing against other pose estimators.
 """
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from kaia_commons.models import KeyPointConfigurationEnum, KeyPointConfigurationFactory
@@ -90,14 +90,43 @@ class Sam3DBodyInferenceEngine:
         batch_outputs = engine.run_batch([img1, img2])
     """
 
-    def __init__(self, estimator: SAM3DBodyEstimator, bbox_thresh: float = 0.8, use_mask: bool = False):
+    def __init__(
+        self,
+        estimator: SAM3DBodyEstimator,
+        bbox_thresh: float = 0.8,
+        use_mask: bool = False,
+        kp_config: Optional[Any] = None,
+    ):
         self.estimator = estimator
         self.bbox_thresh = bbox_thresh
         self.use_mask = use_mask
+        self.kp_config = kp_config or KeyPointConfigurationFactory.from_enum(
+            KeyPointConfigurationEnum.KAIA_23
+        )
+
+    def _attach_kaia23_keypoints(self, predictions: List[Dict], image_shape: Tuple[int, int, int]) -> List[Dict]:
+        """Attach KAIA_23 keypoints derived from each SAM prediction."""
+        if not predictions:
+            return predictions
+
+        for prediction in predictions:
+            keypoints, mask = extract_kaia23_keypoints(
+                prediction,
+                image_shape=image_shape,
+                kp_config=self.kp_config,
+            )
+            prediction["kaia23_keypoints"] = keypoints
+            prediction["kaia23_mask"] = mask
+        return predictions
 
     def run_single(self, image_bgr: np.ndarray):
-        """Run inference on a single BGR image."""
-        return self.estimator.process_one_image(image_bgr, bbox_thr=self.bbox_thresh, use_mask=self.use_mask)
+        """Run inference on a single BGR image and attach KAIA_23 keypoints."""
+        predictions = self.estimator.process_one_image(
+            image_bgr,
+            bbox_thr=self.bbox_thresh,
+            use_mask=self.use_mask,
+        )
+        return self._attach_kaia23_keypoints(predictions, image_shape=image_bgr.shape)
 
     def run_batch(self, images_bgr: Sequence[np.ndarray]) -> List[List[Dict]]:
         """Run inference on a batch of BGR images; returns per-image outputs."""

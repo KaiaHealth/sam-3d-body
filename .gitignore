@@ -119,3 +119,7 @@ debug/
 **/.dist_test
 sandbox*
 *.sh
+
+
+data/kaia_small_sam_exports
+data_providers

@@ -26,17 +26,11 @@ MODEL_CHOICES = {
 # Ensure repo root is on the path, matching demo.py behavior
 root = pyrootutils.setup_root(search_from=__file__, indicator=[".git", "pyproject.toml", ".sl"], pythonpath=True)
 
-from sam_3d_body import SAM3DBodyEstimator, load_sam_3d_body
 from tools.vis_utils import visualize_sample_together
 from pose_inference.engine import PoseInferenceEngine
 from kaia_commons.models import KeyPointConfigurationEnum, KeyPointConfigurationFactory
+from sam_utils import build_estimator as build_estimator_impl
 from sam_inference_engine import Sam3DBodyInferenceEngine
-
-
-def pick_device(use_cuda: bool) -> str:
-    if use_cuda and torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
 
 
 @st.cache_resource(show_spinner=True)
@@ -53,37 +47,22 @@ def build_estimator(
     use_fov: bool,
     fov_name: str,
     fov_path: str,
-) -> Tuple[SAM3DBodyEstimator, str]:
+):
     """Load model and optional helper modules once."""
-    device_str = pick_device(use_cuda=use_cuda)
-    model, model_cfg = load_sam_3d_body(checkpoint_path=checkpoint_path, device=device_str, mhr_path=mhr_path)
-
-    human_detector = None
-    if use_detector:
-        from tools.build_detector import HumanDetector
-
-        human_detector = HumanDetector(name=detector_name, device=device_str, path=detector_path)
-
-    human_segmentor = None
-    if use_segmentor:
-        from tools.build_sam import HumanSegmentor
-
-        human_segmentor = HumanSegmentor(name=segmentor_name, device=device_str, path=segmentor_path)
-
-    fov_estimator = None
-    if use_fov:
-        from tools.build_fov_estimator import FOVEstimator
-
-        fov_estimator = FOVEstimator(name=fov_name, device=device_str, path=fov_path)
-
-    estimator = SAM3DBodyEstimator(
-        sam_3d_body_model=model,
-        model_cfg=model_cfg,
-        human_detector=human_detector,
-        human_segmentor=human_segmentor,
-        fov_estimator=fov_estimator,
+    return build_estimator_impl(
+        checkpoint_path=checkpoint_path,
+        mhr_path=mhr_path,
+        use_cuda=use_cuda,
+        use_detector=use_detector,
+        detector_name=detector_name,
+        detector_path=detector_path,
+        use_segmentor=use_segmentor,
+        segmentor_name=segmentor_name,
+        segmentor_path=segmentor_path,
+        use_fov=use_fov,
+        fov_name=fov_name,
+        fov_path=fov_path,
     )
-    return estimator, device_str
 
 
 def decode_image(uploaded_file) -> np.ndarray:
@@ -576,6 +555,7 @@ def main():
         estimator, device_str = build_estimator(
             checkpoint_path=checkpoint_path,
             mhr_path=mhr_path,
+            model_config_path=None,
             use_cuda=use_cuda,
             use_detector=use_detector,
             detector_name="vitdet",

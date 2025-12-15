@@ -133,7 +133,7 @@ def process_dataset(
             keypoints_norm[:, 0] = (keypoints_norm[:, 0] / float(w)) * 0.75
             keypoints_norm[:, 1] = keypoints_norm[:, 1] / float(h)
             if frame.get("is_landscape", False):
-                keypoints_norm = rotate_keypoints_90(keypoints_norm, clockwise=True)
+                keypoints_norm = rotate_keypoints_90(keypoints_norm, clockwise=False)
             body = _build_body_dict(
                 kp_config=kp_config,
                 keypoints_norm=keypoints_norm,

@@ -50,6 +50,40 @@ def body_to_pixels(body: Dict[str, Dict[str, float]], kp_config, img_shape: Tupl
     return pts
 
 
+def normalized_body_to_pixel_points(
+    body: Dict[str, Dict[str, float]],
+    kp_config,
+    img_shape: Tuple[int, int, int],
+    is_landscape: bool,
+) -> List[Tuple[float, float]]:
+    """
+    Convert a normalized BODY dict (x in [0,0.75], y in [0,1]) to pixel points,
+    applying the landscape rotation back to image space when needed.
+    """
+    kp_arr = np.full((len(kp_config), 2), np.nan, dtype=np.float32)
+    mask = np.zeros((len(kp_config),), dtype=bool)
+    for idx, name in enumerate(kp_config.keypoint_names):
+        kp = body.get(name)
+        if kp and not kp.get("i"):
+            kp_arr[idx, 0] = kp.get("x", 0.0)
+            kp_arr[idx, 1] = kp.get("y", 0.0)
+            mask[idx] = True
+
+    if is_landscape:
+        kp_arr = rotate_keypoints_90(kp_arr, clockwise=True)
+
+    h, w = img_shape[:2]
+    pts: List[Tuple[float, float]] = []
+    for idx in range(len(kp_config)):
+        if not mask[idx] or np.isnan(kp_arr[idx, 0]) or np.isnan(kp_arr[idx, 1]):
+            pts.append(None)
+            continue
+        x = float(kp_arr[idx, 0]) * (w / 0.75)
+        y = float(kp_arr[idx, 1]) * h
+        pts.append((x, y))
+    return pts
+
+
 def draw_points(img: np.ndarray, points: List[Tuple[float, float]], color: Tuple[int, int, int]):
     out = img.copy()
     for pt in points:
@@ -102,53 +136,24 @@ def main():
             print(f"[warn] GT frame {frame_id} not found in provider release, skipping")
             continue
 
-        body = gt_frame["ground_truth"]["body"]
-        # Rotate all GT keypoints 90° clockwise in normalized space before plotting
-        kp_arr = np.full((len(kp_config), 2), np.nan, dtype=np.float32)
-        for idx, name in enumerate(kp_config.keypoint_names):
-            kp = body.get(name)
-            if kp and not kp.get("i"):
-                kp_arr[idx, 0] = kp.get("x", 0.0)
-                kp_arr[idx, 1] = kp.get("y", 0.0)
-        kp_arr = rotate_keypoints_90(kp_arr, clockwise=True)
-        rotated_body = {}
-        for idx, name in enumerate(kp_config.keypoint_names):
-            kp = body.get(name, {})
-            if np.isnan(kp_arr[idx, 0]) or np.isnan(kp_arr[idx, 1]) or kp.get("i"):
-                rotated_body[name] = {"x": float("nan"), "y": float("nan"), "i": True}
-            else:
-                rotated_body[name] = {"x": float(kp_arr[idx, 0]), "y": float(kp_arr[idx, 1]), "c": kp.get("c", 1.0)}
-
-        body_pts = body_to_pixels(rotated_body, kp_config, img.shape)
+        body_pts = normalized_body_to_pixel_points(
+            gt_frame["ground_truth"]["body"],
+            kp_config,
+            img.shape,
+            is_landscape=gt_frame.get("is_landscape", False),
+        )
 
         # SAM keypoints (already normalized; apply same rotation and scaling)
         sam_frame = sam_map.get(frame_id)
         sam_pts = []
         if sam_frame:
             sam_body = sam_frame["ground_truth"]["body"]
-            kp_arr_sam = np.full((len(kp_config), 2), np.nan, dtype=np.float32)
-            mask_sam = np.zeros((len(kp_config),), dtype=bool)
-            for idx, name in enumerate(kp_config.keypoint_names):
-                kp = sam_body.get(name)
-                if kp and not kp.get("i"):
-                    # SAM keypoints already normalized to [0,0.75] x [0,1]; no rescale needed
-                    kp_arr_sam[idx, 0] = kp.get("x", 0.0)
-                    kp_arr_sam[idx, 1] = kp.get("y", 0.0)
-                    mask_sam[idx] = True
-            # Rotate SAM keypoints -90° (counterclockwise) to align with GT overlay
-            kp_arr_sam = rotate_keypoints_90(kp_arr_sam, clockwise=False)
-            rotated_sam_body = {}
-            for idx, name in enumerate(kp_config.keypoint_names):
-                kp = sam_body.get(name, {})
-                if np.isnan(kp_arr_sam[idx, 0]) or np.isnan(kp_arr_sam[idx, 1]) or not mask_sam[idx] or kp.get("i"):
-                    rotated_sam_body[name] = {"x": float("nan"), "y": float("nan"), "i": True}
-                else:
-                    rotated_sam_body[name] = {
-                        "x": float(kp_arr_sam[idx, 0]),
-                        "y": float(kp_arr_sam[idx, 1]),
-                        "c": kp.get("c", 1.0),
-                    }
-            sam_pts = body_to_pixels(rotated_sam_body, kp_config, img.shape)
+            sam_pts = normalized_body_to_pixel_points(
+                sam_body,
+                kp_config,
+                img.shape,
+                is_landscape=gt_frame.get("is_landscape", False),
+            )
         else:
             sam_pts = [None] * len(body_pts)
 

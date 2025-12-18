@@ -4,7 +4,8 @@ Create quick overlays of ground-truth keypoints on dataset images.
 Usage:
     python visualize_sam_overlays.py \\
         --dataset-dir data/kaia_small_sam_exports/dataset_21_release_45_sam \\
-        --provider data_providers/kccd_2d/dataset_21_release_45.yaml
+        --provider data_providers/kccd_2d/dataset_21_release_45.yaml \\
+        [--show-mesh --mhr-model checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt]
 
 Outputs PNGs for the first N frames (default 10) into dataset-dir/overlays/.
 """
@@ -12,7 +13,7 @@ Outputs PNGs for the first N frames (default 10) into dataset-dir/overlays/.
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -20,6 +21,8 @@ from kaia_commons.kccd import DatasetManager
 from kaia_commons.models import KeyPointConfigurationEnum, KeyPointConfigurationFactory
 from kaia_commons.utils.file_utils import read_yaml
 from kaia_commons.utils.keypoints_2d import rotate_keypoints_90
+
+MESH_COLOR = (0.65098039, 0.74117647, 0.85882353)
 
 
 def load_provider_info(provider_path: Path):
@@ -93,6 +96,76 @@ def draw_points(img: np.ndarray, points: List[Tuple[float, float]], color: Tuple
     return out
 
 
+def load_first_prediction(extras_dir: Path, frame_id: int) -> Optional[Dict]:
+    """Load the first detection stored in extras/<frame_id>.npz."""
+    npz_path = extras_dir / f"{frame_id}.npz"
+    if npz_path.exists():
+        # Some fields may have been saved as object arrays; allow pickle to handle them.
+        with np.load(npz_path, allow_pickle=True) as data:
+            has_prediction = bool(np.array(data["has_prediction"]).item()) if "has_prediction" in data.files else True
+            if not has_prediction:
+                return None
+            return {k: np.array(data[k]) for k in data.files if k != "has_prediction"}
+    return None
+
+
+def kaia23_points_from_prediction(
+    prediction: Dict,
+    kp_config,
+) -> List[Optional[Tuple[float, float]]]:
+    """Extract KAIA_23 keypoints in pixel space from a prediction dict with mask."""
+    keypoints = np.asarray(prediction.get("kaia23_keypoints", []))
+    mask = np.asarray(prediction.get("kaia23_mask", []), dtype=bool)
+    pts: List[Optional[Tuple[float, float]]] = []
+    for idx in range(len(kp_config)):
+        if idx >= len(keypoints) or idx >= len(mask) or not mask[idx]:
+            pts.append(None)
+            continue
+        x, y = keypoints[idx]
+        pts.append((float(x), float(y)))
+    return pts
+
+
+def load_mhr_faces(mhr_model_path: Path) -> Optional[np.ndarray]:
+    """Load mesh faces from the TorchScript MHR asset (used for rendering meshes)."""
+    try:
+        import torch
+    except ImportError:
+        print("[warn] torch is required to load faces for mesh rendering")
+        return None
+
+    if not mhr_model_path.exists():
+        print(f"[warn] mhr_model.pt not found at {mhr_model_path}, skipping mesh rendering")
+        return None
+
+    try:
+        model = torch.jit.load(str(mhr_model_path), map_location="cpu")
+        faces = model.character_torch.mesh.faces.to("cpu").numpy()
+        return faces
+    except Exception as exc:
+        print(f"[warn] failed to load faces from {mhr_model_path}: {exc}")
+        return None
+
+
+def render_mesh_overlay(
+    img_bgr: np.ndarray,
+    prediction: Dict,
+    faces: np.ndarray,
+) -> np.ndarray:
+    """Render the predicted mesh onto the input image."""
+    from sam_3d_body.visualization.renderer import Renderer
+
+    renderer = Renderer(focal_length=float(np.asarray(prediction["focal_length"])), faces=faces)
+    rendered = renderer(
+        np.asarray(prediction["pred_vertices"]),
+        np.asarray(prediction["pred_cam_t"]),
+        img_bgr.copy(),
+        mesh_base_color=MESH_COLOR,
+        scene_bg_color=(1, 1, 1),
+    )
+    return (rendered * 255).astype(np.uint8)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize GT vs SAM keypoints on first N frames.")
     parser.add_argument(
@@ -100,6 +173,17 @@ def main():
     )
     parser.add_argument("--provider", type=Path, required=True, help="Data provider YAML (for keypoint config).")
     parser.add_argument("--limit", type=int, default=10, help="Number of frames to render.")
+    parser.add_argument(
+        "--show-mesh",
+        action="store_true",
+        help="Render the predicted mesh on top of the image using extras/<frame_id>.npz (requires mhr_model.pt).",
+    )
+    parser.add_argument(
+        "--mhr-model",
+        type=Path,
+        default=Path("checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt"),
+        help="Path to mhr_model.pt (TorchScript). Needed when --show-mesh is set.",
+    )
     args = parser.parse_args()
 
     dataset_dir = args.dataset_dir
@@ -112,12 +196,12 @@ def main():
     gt_frames = dataset.get_frames(**(provider_info.get("filters") or {}))
     gt_frames_map = {frame["id"]: frame for frame in gt_frames}
 
-    # SAM outputs (normalized keypoints with is_landscape already applied in the export)
-    sam_descriptor = json.loads((dataset_dir / "descriptor.json").read_text())
-    sam_map = {entry["id"]: entry for entry in sam_descriptor.get("frames", [])}
-
     overlays_dir = dataset_dir / "overlays"
     overlays_dir.mkdir(parents=True, exist_ok=True)
+    extras_dir = dataset_dir / "extras"
+    faces = load_mhr_faces(args.mhr_model) if args.show_mesh else None
+    sam_descriptor = json.loads((dataset_dir / "descriptor.json").read_text())
+    sam_map = {entry["id"]: entry for entry in sam_descriptor.get("frames", [])}
 
     frames = gt_frames[: args.limit]
     for frame in frames:
@@ -143,21 +227,31 @@ def main():
             is_landscape=gt_frame.get("is_landscape", False),
         )
 
-        # SAM keypoints (already normalized; apply same rotation and scaling)
+        # SAM keypoints from descriptor.json (normalized coords; rotate/scale to pixels)
         sam_frame = sam_map.get(frame_id)
-        sam_pts = []
         if sam_frame:
             sam_body = sam_frame["ground_truth"]["body"]
             sam_pts = normalized_body_to_pixel_points(
                 sam_body,
                 kp_config,
                 img.shape,
-                is_landscape=gt_frame.get("is_landscape", False),
+                is_landscape=sam_frame.get("is_landscape", gt_frame.get("is_landscape", False)),
             )
         else:
             sam_pts = [None] * len(body_pts)
 
-        overlay = draw_points(img, body_pts, color=(0, 255, 0))  # GT in green
+        overlay_base = img
+        prediction = None
+        if args.show_mesh and faces is not None:
+            prediction = load_first_prediction(extras_dir, frame_id)
+            if prediction is not None:
+                try:
+                    overlay_base = render_mesh_overlay(img, prediction, faces)
+                except Exception as exc:
+                    print(f"[warn] failed to render mesh for frame {frame_id}: {exc}")
+                    overlay_base = img
+
+        overlay = draw_points(overlay_base, body_pts, color=(0, 255, 0))  # GT in green
         overlay = draw_points(overlay, sam_pts, color=(255, 0, 0))  # SAM in blue
 
         out_path = overlays_dir / f"{frame_id}.png"

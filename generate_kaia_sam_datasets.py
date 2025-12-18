@@ -9,7 +9,13 @@ Each output dataset mirrors the usual layout:
     {split}_sam/
         images/            # copied PNGs
         descriptor.json    # KAIA_23 keypoints normalized to [0, 1]
-        sam_outputs.json   # full SAM outputs per frame (all detections)
+        extras/            # per-frame SAM outputs (.npz) for the first detection
+        extras/<frame_id>.npz structure:
+            - one array per key in the first prediction dict (bbox, pred_vertices, etc.),
+              stored directly in the NPZ for easy access (no pickling). Example:
+                data = np.load("extras/12345.npz")
+                verts = data["pred_vertices"]
+            - `has_prediction` is always present (True when a detection exists, False otherwise).
 """
 
 import argparse
@@ -78,6 +84,20 @@ def _write_json(path: Path, obj: Any):
     path.write_bytes(orjson.dumps(obj, option=orjson.OPT_INDENT_2))
 
 
+def _write_extras_npz(path: Path, prediction: Dict[str, Any]) -> None:
+    """
+    Persist the first SAM prediction for a frame as a compressed NPZ with keys accessible directly.
+    """
+    if not prediction:
+        np.savez_compressed(path, has_prediction=np.asarray(False))
+        return
+
+    serializable_prediction = _to_serializable(prediction)
+    arrays = {"has_prediction": np.asarray(True)}
+    arrays.update({k: np.asarray(v) for k, v in serializable_prediction.items()})
+    np.savez_compressed(path, **arrays)
+
+
 def process_dataset(
     name: str,
     dataset_info: Dict[str, Any],
@@ -100,13 +120,13 @@ def process_dataset(
 
     split_out_dir = output_root / name
     images_out_dir = split_out_dir / "images"
+    extras_out_dir = split_out_dir / "extras"
     descriptor_path = split_out_dir / "descriptor.json"
-    sam_outputs_path = split_out_dir / "sam_outputs.json"
     split_out_dir.mkdir(parents=True, exist_ok=True)
     images_out_dir.mkdir(parents=True, exist_ok=True)
+    extras_out_dir.mkdir(parents=True, exist_ok=True)
 
     descriptor_frames: List[dict] = []
-    sam_outputs: List[dict] = []
 
     for frame in tqdm(frames, desc=f"Processing {name}", unit="frame"):
         frame_id = frame["id"]
@@ -125,8 +145,9 @@ def process_dataset(
         if len(predictions) == 0:
             print(f"[warn] no detections for frame {frame_id}, writing empty body")
             body = _empty_body_dict(kp_config)
+            first_pred = {}
         else:
-            # Pick the first person (dataset frames are single-person); keep all in sam_outputs.json
+            # Pick the first person (dataset frames are single-person); keep only this detection in extras NPZ
             first_pred = predictions[0]
             keypoints_norm = np.asarray(first_pred["kaia23_keypoints"], dtype=np.float32).copy()
             # Normalize to the same 4:3 space as GT (x in [0, 0.75], y in [0, 1])
@@ -147,21 +168,21 @@ def process_dataset(
                 "ground_truth": {"body": body},
             }
         )
-        sam_outputs.append({"frame_id": frame_id, "predictions": _to_serializable(predictions)})
+
+        extras_path = extras_out_dir / f"{frame_id}.npz"
+        _write_extras_npz(extras_path, prediction=first_pred)
 
         # Copy image to output dataset
         shutil.copy2(img_path, images_out_dir / img_path.name)
 
-        # Persist progress after first 10 frames
-        if len(descriptor_frames) == 10:
+        # Persist progress after N frames
+        if len(descriptor_frames) in [10, 100, 1000]:
             _write_json(descriptor_path, {"frames": descriptor_frames})
-            _write_json(sam_outputs_path, sam_outputs)
 
     # Final write at the end
     _write_json(descriptor_path, {"frames": descriptor_frames})
-    _write_json(sam_outputs_path, sam_outputs)
 
-    print(f"[done] wrote {descriptor_path} and {sam_outputs_path} ({len(descriptor_frames)} frames)")
+    print(f"[done] wrote {descriptor_path} and extras to {extras_out_dir} ({len(descriptor_frames)} frames)")
 
 
 def _dataset_info_from_provider(path: Path) -> Dict[str, Any]:

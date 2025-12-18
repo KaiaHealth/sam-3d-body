@@ -71,13 +71,12 @@ def extract_kaia23_keypoints(
         vert_idx = MAPPING.get(name)
         if vert_idx is None or vert_idx >= len(verts_2d):
             continue
-        keypoints[idx] = verts_2d[vert_idx]
+        x, y = verts_2d[vert_idx]
+        # Mark keypoints outside the image as invisible (mask False)
+        if x < 0 or x >= img_w or y < 0 or y >= img_h:
+            continue
+        keypoints[idx] = [x, y]
         mask[idx] = True
-
-    valid_x = ~np.isnan(keypoints[:, 0])
-    valid_y = ~np.isnan(keypoints[:, 1])
-    keypoints[valid_x, 0] = np.clip(keypoints[valid_x, 0], 0, img_w - 1)
-    keypoints[valid_y, 1] = np.clip(keypoints[valid_y, 1], 0, img_h - 1)
     return keypoints, mask
 
 

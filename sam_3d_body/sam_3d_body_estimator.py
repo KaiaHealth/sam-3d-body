@@ -191,12 +191,18 @@ class SAM3DBodyEstimator:
         out = pose_output["mhr"]
         out = recursive_to(out, "cpu")
         out = recursive_to(out, "numpy")
+        head = self.model.head_pose
+        scale_mean = head.scale_mean.cpu().numpy()
+        scale_comps = head.scale_comps.cpu().numpy()
         all_out = []
         for idx in range(batch["img"].shape[1]):
+            skeleton_trans = scale_mean + out["scale"][idx] @ scale_comps
             all_out.append(
                 {
                     "bbox": batch["bbox"][0, idx].cpu().numpy(),
+                    "cam_int": batch["cam_int"][0].cpu().numpy(),
                     "focal_length": out["focal_length"][idx],
+                    "skeleton_trans": skeleton_trans,
                     "pred_keypoints_3d": out["pred_keypoints_3d"][idx],
                     "pred_keypoints_2d": out["pred_keypoints_2d"][idx],
                     "pred_vertices": out["pred_vertices"][idx],
